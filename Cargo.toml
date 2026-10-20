@@ -1,0 +1,17 @@
+[package]
+name = "l850-cops"
+version = "0.1.0"
+edition = "2021"
+description = "Fibocom L850-GL manual network scan/select via AT commands (bypass Windows MBIM UI limits)"
+
+[dependencies]
+serialport = "4.3"
+iced = { version = "0.13", features = ["tokio"] }
+
+[profile.release]
+strip = true
+lto = true
+panic = "abort"
+
+[build-dependencies]
+embed-manifest = "1.4"
