@@ -40,20 +40,27 @@ const CONSOLE_TIME: Color = iced::color!(0x47, 0x55, 0x69);
 const SPIN: [&str; 4] = ["|", "/", "-", "\\"];
 
 pub fn run() -> iced::Result {
-    let mut builder = iced::application("L850-GL AT 工具", update, view)
+    // 字体：优先微软雅黑（更清晰美观），回退黑体
+    let (font, font_bytes) = match std::fs::read("C:/Windows/Fonts/msyh.ttc") {
+        Ok(bytes) => (Font::with_name("Microsoft YaHei"), bytes),
+        Err(_) => match std::fs::read("C:/Windows/Fonts/simhei.ttf") {
+            Ok(bytes) => (Font::with_name("SimHei"), bytes),
+            Err(_) => (Font::default(), Vec::new()),
+        },
+    };
+    iced::application("L850-GL AT 工具", update, view)
         .theme(|_| Theme::Light)
+        .default_font(font)
         .subscription(subscription)
         .window(window::Settings {
-            size: iced::Size::new(1020.0, 800.0),
+            size: iced::Size::new(960.0, 720.0),
+            min_size: Some(iced::Size::new(860.0, 640.0)),
             ..Default::default()
         })
-        .centered();
-    // 中文字体（iced 默认字体不含 CJK）
-    if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/simhei.ttf") {
-        builder = builder.default_font(Font::with_name("SimHei")).font(bytes);
-    }
-    // 启动即自动探测一次串口
-    builder.run_with(|| (App::default(), Task::done(Msg::Detect)))
+        .font(font_bytes)
+        .centered()
+        // 启动即自动探测一次串口
+        .run_with(|| (App::default(), Task::done(Msg::Detect)))
 }
 
 // ================= 数据模型 =================

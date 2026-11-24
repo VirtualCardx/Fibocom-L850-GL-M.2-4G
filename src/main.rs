@@ -1,8 +1,12 @@
 // ============================================================
 // l850-cops — Fibocom L850-GL 手动搜网/选网工具
-//   无参数启动 → iced GUI
-//   带子命令  → CLI
+//   无参数启动 → iced GUI（无命令行黑窗）
+//   带子命令  → CLI（自动挂接父终端输出）
 // ============================================================
+
+// windows 子系统：启动 GUI 时不附带命令行窗口；
+// CLI 场景通过 AttachConsole 挂回父终端，输出不受影响
+#![windows_subsystem = "windows"]
 
 mod at;
 mod gui;
@@ -10,12 +14,29 @@ mod gui;
 use std::env;
 use std::io::Write;
 
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(dwProcessId: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         gui::run().expect("GUI 运行失败");
         return;
     }
+    // CLI 模式：挂接父终端（windows 子系统默认无控制台）
+    attach_parent_console();
     if let Err(e) = cli(args) {
         eprintln!("错误: {e}");
         std::process::exit(1);
