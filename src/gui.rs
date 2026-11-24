@@ -753,16 +753,22 @@ fn view(app: &App) -> El<'_> {
         btn("释放串口", Btn::Primary, press_any(Msg::Free)),
         btn("恢复串口", Btn::Secondary, press_any(Msg::Restore)),
         horizontal_space(),
-        text("禁用 ModemControl 不影响蜂窝上网")
-            .size(11)
-            .color(FAINT),
     ]
     .spacing(10)
     .align_y(iced::Alignment::Center);
     if app.freed {
         conn_row = conn_row.push(badge("√ 已释放", GREEN, GREEN_SOFT));
     }
-    let conn_card = card(row![conn_row].width(Length::Fill));
+    // 提示文字单独一行，避免窄窗口下被右缘裁切
+    let conn_card = card(
+        column![
+            conn_row,
+            text("提示: 禁用 ModemControl 不影响蜂窝上网；恢复串口会还原服务与设备")
+                .size(11)
+                .color(FAINT),
+        ]
+        .spacing(6),
+    );
 
     // ---- 状态磁贴 ----
     let tiles: Vec<El> = match &app.status {

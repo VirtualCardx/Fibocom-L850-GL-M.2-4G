@@ -706,30 +706,29 @@ pub fn set_mode(name: &str, arg: Option<&str>) -> DynResult<String> {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 释放脚本：停联想 SIM 锁/DPR 服务 + 禁用 ModemControl，并把结果写入 result 文件
+/// 注意：net stop 在有依赖服务时会等 Y/N 确认导致挂起 —— 一律用 Stop-Service -Force
 const FREE_PS: &str = r#"
 $ErrorActionPreference = 'Continue'
 $lines = @()
-net stop ModemAuthenticatorService 2>$null | Out-Null
-taskkill /IM ModemAuthenticator.exe /F 2>$null | Out-Null
-net stop LENOVO.DPRSVCMON 2>$null | Out-Null
-taskkill /IM LENOVO.DPRSVCMON.exe /F 2>$null | Out-Null
-net stop LENOVO.DPRSVC 2>$null | Out-Null
-taskkill /IM LENOVO.DPRSVC.exe /F 2>$null | Out-Null
-# DPRSVCMON 是看门狗，会自动重启服务；禁用服务防止复活（restore 时还原启动类型）
-sc.exe config ModemAuthenticatorService start= disabled 2>$null | Out-Null
-sc.exe config LENOVO.DPRSVCMON start= disabled 2>$null | Out-Null
-sc.exe config LENOVO.DPRSVC start= disabled 2>$null | Out-Null
 try {
-  $ids = (Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction Stop).InstanceId
-  if (-not $ids) { throw 'ModemControl 设备未找到' }
-  foreach ($id in $ids) { pnputil /disable-device "$id" | Out-Null }
-  $lines += 'DISABLE_OK'
-} catch {
-  $lines += ('DISABLE_ERR: ' + $_.Exception.Message)
+  foreach ($n in 'ModemAuthenticatorService','LENOVO.DPRSVCMON','LENOVO.DPRSVC') {
+    Stop-Service -Name $n -Force -ErrorAction SilentlyContinue
+    Set-Service -Name $n -StartupType Disabled -ErrorAction SilentlyContinue
+  }
+  Get-Process ModemAuthenticator,LENOVO.DPRSVCMON,LENOVO.DPRSVC -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  $ids = (Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction SilentlyContinue).InstanceId
+  if (-not $ids) {
+    $lines += 'DISABLE_ERR: ModemControl 设备未找到'
+  } else {
+    foreach ($id in $ids) { pnputil /disable-device "$id" | Out-Null }
+    $lines += 'DISABLE_OK'
+  }
+  Start-Sleep -Seconds 1
+  $mc = Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction SilentlyContinue
+  $lines += ('ModemControl=' + $(if ($mc) { $mc.Status } else { 'NotFound' }))
+} finally {
+  $lines | Out-File -FilePath '__RESULT__' -Encoding utf8
 }
-Start-Sleep -Seconds 1
-$mc = Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction SilentlyContinue
-$lines += ('ModemControl=' + $(if ($mc) { $mc.Status } else { 'NotFound' }))
 "#;
 
 /// 恢复脚本：启用 ModemControl + 还原服务启动类型并启动
@@ -737,22 +736,25 @@ const RESTORE_PS: &str = r#"
 $ErrorActionPreference = 'Continue'
 $lines = @()
 try {
-  $ids = (Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction Stop).InstanceId
-  if (-not $ids) { throw 'ModemControl 设备未找到' }
-  foreach ($id in $ids) { pnputil /enable-device "$id" | Out-Null }
-  $lines += 'ENABLE_OK'
-} catch {
-  $lines += ('ENABLE_ERR: ' + $_.Exception.Message)
+  $ids = (Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction SilentlyContinue).InstanceId
+  if (-not $ids) {
+    $lines += 'ENABLE_ERR: ModemControl 设备未找到'
+  } else {
+    foreach ($id in $ids) { pnputil /enable-device "$id" | Out-Null }
+    $lines += 'ENABLE_OK'
+  }
+  Start-Sleep -Seconds 1
+  Set-Service -Name ModemAuthenticatorService -StartupType Automatic -ErrorAction SilentlyContinue
+  Set-Service -Name LENOVO.DPRSVCMON -StartupType Automatic -ErrorAction SilentlyContinue
+  Set-Service -Name LENOVO.DPRSVC -StartupType Manual -ErrorAction SilentlyContinue
+  Start-Service -Name ModemAuthenticatorService -ErrorAction SilentlyContinue
+  Start-Service -Name LENOVO.DPRSVCMON -ErrorAction SilentlyContinue
+  Start-Service -Name LENOVO.DPRSVC -ErrorAction SilentlyContinue
+  $mc = Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction SilentlyContinue
+  $lines += ('ModemControl=' + $(if ($mc) { $mc.Status } else { 'NotFound' }))
+} finally {
+  $lines | Out-File -FilePath '__RESULT__' -Encoding utf8
 }
-Start-Sleep -Seconds 1
-sc.exe config ModemAuthenticatorService start= auto 2>$null | Out-Null
-sc.exe config LENOVO.DPRSVCMON start= auto 2>$null | Out-Null
-sc.exe config LENOVO.DPRSVC start= manual 2>$null | Out-Null
-net start ModemAuthenticatorService 2>$null | Out-Null
-net start LENOVO.DPRSVCMON 2>$null | Out-Null
-net start LENOVO.DPRSVC 2>$null | Out-Null
-$mc = Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction SilentlyContinue
-$lines += ('ModemControl=' + $(if ($mc) { $mc.Status } else { 'NotFound' }))
 "#;
 
 /// 检测当前进程是否已以管理员身份运行（net session 仅管理员可成功）
@@ -782,25 +784,51 @@ fn run_elevated_ps(script_body: &str) -> DynResult<String> {
     let result_path = tmp.join("l850-cops-action.result");
     let _ = std::fs::remove_file(&result_path);
 
-    let script = format!(
-        "{}\n$lines | Out-File -FilePath '{}' -Encoding ascii\n",
-        script_body,
-        result_path.to_string_lossy().replace('\'', "''")
-    );
+    // 关键：Windows PowerShell 5.1 对无 BOM 文件按 ANSI 解析，
+    // 脚本里的中文注释/字符串会被拆成乱码字节导致语法错误或挂起 —— 必须带 UTF-8 BOM
+    let mut script = String::from("\u{feff}");
+    script.push_str(script_body);
+    script.push('\n');
+    let result_str = result_path.to_string_lossy().replace('\'', "''");
+    script = script.replace("__RESULT__", &result_str);
     std::fs::write(&ps_path, script)?;
 
     let ps_str = ps_path.to_string_lossy().to_string();
     if is_elevated() {
         // GUI 已带 requireAdministrator 清单运行，直接执行，无 UAC
-        Command::new("powershell")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &ps_str])
+        let mut child = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &ps_str,
+            ])
             .creation_flags(CREATE_NO_WINDOW)
-            .output()
+            .spawn()
             .map_err(|e| format!("执行 powershell 失败: {e}"))?;
+
+        // 超时保护：120 秒未结束则杀死，避免界面卡在忙碌状态
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    break None;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                Err(e) => return Err(format!("等待 powershell 失败: {e}").into()),
+            }
+        };
+        if status.is_none() {
+            return Err("脚本执行超时 (120s)，已终止。".into());
+        }
     } else {
         // CLI 未提权时通过 UAC 提权执行
         let cmd_line = format!(
-            "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
+            "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','{}'",
             ps_str.replace('\'', "''")
         );
         let st = Command::new("powershell")
@@ -816,8 +844,9 @@ fn run_elevated_ps(script_body: &str) -> DynResult<String> {
     // 给结果文件落盘留一点时间
     for _ in 0..20 {
         if let Ok(s) = std::fs::read_to_string(&result_path) {
+            let s = s.trim_start_matches('\u{feff}');
             if !s.trim().is_empty() {
-                return Ok(s);
+                return Ok(s.to_string());
             }
         }
         std::thread::sleep(Duration::from_millis(200));
