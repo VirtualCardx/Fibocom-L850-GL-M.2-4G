@@ -1012,9 +1012,11 @@ fn view(app: &App) -> El<'_> {
         column![rows].into()
     };
 
-    let table_area = container(scrollable(
-        column![head, scan_hint].width(Length::Fill).spacing(2),
-    ))
+    // scrollable 必须显式撑满宽度，否则滚动条画在内容最宽处而不是右缘
+    let table_area = container(
+        scrollable(column![head, scan_hint].width(Length::Fill).spacing(2))
+            .width(Length::Fill),
+    )
     .height(Length::Fill)
     .width(Length::Fill);
 
@@ -1039,9 +1041,11 @@ fn view(app: &App) -> El<'_> {
                 .color(CONSOLE_TIME),
         );
     }
-    let log_area = container(scrollable(log_col))
+    // 高度用 Fill：默认窗口约 140px，窗口拉大时日志区跟着变大（真正的终端体验），
+    // 窗口变矮时自动收缩滚动，不再把底部内容裁出窗口
+    let log_area = container(scrollable(log_col).width(Length::Fill))
         .width(Length::Fill)
-        .height(Length::Fixed(150.0))
+        .height(Length::Fill)
         .padding(10)
         .style(|_t: &Theme| iced::widget::container::Style {
             text_color: None,
