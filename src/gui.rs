@@ -156,6 +156,19 @@ impl Busy {
             Self::Mode => "应用制式",
         }
     }
+
+    /// 看门狗上限（秒）：底层挂死时自动解除界面锁定
+    fn max_secs(self) -> u64 {
+        match self {
+            Self::Free => 150,
+            Self::Restore => 60,
+            Self::Detect => 60,
+            Self::Status => 30,
+            Self::Scan => 200,
+            Self::Select => 140,
+            Self::Mode => 40,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,14 +226,14 @@ struct App {
 }
 
 impl App {
-    fn log_line(&mut self, s: &str) {
+    fn push_log(&mut self, s: &str, lvl: Lvl) {
         let secs = self.started.elapsed().as_secs();
         self.logs.insert(
             0,
             LogEntry {
                 t: format!("{:02}:{:02}", secs / 60, secs % 60),
                 text: s.to_string(),
-                lvl: classify(s),
+                lvl,
             },
         );
         if self.logs.len() > 300 {
@@ -228,16 +241,13 @@ impl App {
         }
     }
 
+    fn log_line(&mut self, s: &str) {
+        let lvl = classify(s);
+        self.push_log(s, lvl);
+    }
+
     fn log_ok(&mut self, s: &str) {
-        let secs = self.started.elapsed().as_secs();
-        self.logs.insert(
-            0,
-            LogEntry {
-                t: format!("{:02}:{:02}", secs / 60, secs % 60),
-                text: s.to_string(),
-                lvl: Lvl::Ok,
-            },
-        );
+        self.push_log(s, Lvl::Ok);
     }
 
     /// 当前应执行的步骤序号 (0-3)
@@ -291,11 +301,13 @@ enum Msg {
     ApplyMode,
     Free,
     Restore,
-    FreeDone(Result<String, String>),
+    FreeDone(bool, Result<String, String>), // bool = 是否恢复操作
+    Oops(String),                           // 工作线程 panic 兜底
     Tick,
 }
 
-/// 把阻塞的串口操作放到工作线程，通过 std channel 回传消息
+/// 把阻塞的串口操作放到工作线程，通过 std channel 回传消息。
+/// job 若 panic，会兜底发送 Msg::Oops，保证界面不会永久卡在忙碌状态。
 fn bg<F>(job: F) -> Task<Msg>
 where
     F: FnOnce(std::sync::mpsc::Sender<Msg>) + Send + 'static,
@@ -303,7 +315,11 @@ where
     Task::stream(iced::stream::channel(64, move |mut out| async move {
         let (tx, rx) = std::sync::mpsc::channel::<Msg>();
         std::thread::spawn(move || {
-            let _ = job(tx);
+            let tx_err = tx.clone();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx)));
+            if r.is_err() {
+                let _ = tx_err.send(Msg::Oops("内部任务异常退出 (panic)".into()));
+            }
         });
         loop {
             match rx.try_recv() {
@@ -496,7 +512,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             app.log_line("释放串口：停联想 SIM 锁/DPR 服务 + 禁用 Intel ModemControl（应用已以管理员运行，无需 UAC）...");
             bg(|tx| {
                 let r = at::free_at_port().map_err(|e| e.to_string());
-                let _ = tx.send(Msg::FreeDone(r));
+                let _ = tx.send(Msg::FreeDone(false, r));
             })
         }
         Msg::Restore => {
@@ -505,18 +521,14 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             app.log_line("恢复串口：重新启用 ModemControl 与联想服务...");
             bg(|tx| {
                 let r = at::restore_at_port().map_err(|e| e.to_string());
-                let _ = tx.send(Msg::FreeDone(r));
+                let _ = tx.send(Msg::FreeDone(true, r));
             })
         }
-        Msg::FreeDone(r) => {
+        Msg::FreeDone(is_restore, r) => {
             app.busy = None;
             match r {
                 Ok(s) => {
-                    if msg_is_restore(&s) {
-                        app.freed = false;
-                    } else {
-                        app.freed = true;
-                    }
+                    app.freed = !is_restore;
                     app.log_ok(&s);
                 }
                 Err(e) => app.log_line(&format!("失败: {e}")),
@@ -524,15 +536,27 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             // 自动重新探测
             update(app, Msg::Detect)
         }
+        Msg::Oops(what) => {
+            app.busy = None;
+            app.log_line(&format!("错误: {what}，操作已中止。可重新点击重试。"));
+            Task::none()
+        }
         Msg::Tick => {
             app.spinner = (app.spinner + 1) % SPIN.len();
+            // 看门狗：底层操作挂死超限时自动解锁界面
+            if let Some(b) = app.busy {
+                if app.busy_since.elapsed() >= Duration::from_secs(b.max_secs()) {
+                    app.busy = None;
+                    app.log_line(&format!(
+                        "错误: {} 超时（超过 {} 秒未返回），已解除界面锁定。请检查串口/模组后重试。",
+                        b.label(),
+                        b.max_secs()
+                    ));
+                }
+            }
             Task::none()
         }
     }
-}
-
-fn msg_is_restore(s: &str) -> bool {
-    s.contains("恢复")
 }
 
 fn subscription(app: &App) -> Subscription<Msg> {

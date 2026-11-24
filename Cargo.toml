@@ -11,7 +11,9 @@ iced = { version = "0.13", features = ["tokio"] }
 [profile.release]
 strip = true
 lto = true
-panic = "abort"
+# 保持 unwind：工作线程 panic 时可捕获并上报 UI，而不是整个进程闪退
+panic = "unwind"
 
 [build-dependencies]
 embed-manifest = "1.4"
+embed-resource = "2"

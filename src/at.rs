@@ -15,6 +15,7 @@ use serialport::{
 };
 
 pub type DynResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+pub type DynError = Box<dyn Error + Send + Sync>;
 
 pub const SCAN_TIMEOUT: Duration = Duration::from_secs(180);
 pub const SELECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -34,6 +35,32 @@ pub fn open_at_port(name: &str, read_timeout_ms: u64) -> DynResult<Box<dyn Seria
     let _ = port.write_data_terminal_ready(true);
     let _ = port.write_request_to_send(true);
     Ok(port)
+}
+
+/// 带重试的打开：设备重枚举后（如刚禁用/启用 ModemControl）COM 口可能延迟几秒才就绪。
+/// 「访问被拒绝」说明被独占，重试无意义，立即返回；其他错误（设备未就绪等）按间隔重试。
+pub fn open_at_port_retry(
+    name: &str,
+    read_timeout_ms: u64,
+    attempts: u32,
+    delay: Duration,
+) -> DynResult<Box<dyn SerialPort>> {
+    let mut last: Option<DynError> = None;
+    for i in 0..attempts {
+        match open_at_port(name, read_timeout_ms) {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                if is_access_denied(e.as_ref()) {
+                    return Err(e);
+                }
+                last = Some(e);
+                if i + 1 < attempts {
+                    std::thread::sleep(delay);
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| "打开串口失败".into()))
 }
 
 fn looks_final(s: &str) -> bool {
@@ -443,7 +470,7 @@ pub fn is_access_denied(e: &(dyn Error + 'static)) -> bool {
 
 /// 手动搜网：AT+COPS=?
 pub fn scan_operators(name: &str, tick: &mut dyn FnMut()) -> DynResult<Vec<Operator>> {
-    let mut port = open_at_port(name, 500)?;
+    let mut port = open_at_port_retry(name, 500, 3, Duration::from_millis(500))?;
     init_modem(port.as_mut())?;
     let resp = send_at_progress(port.as_mut(), "AT+COPS=?", SCAN_TIMEOUT, tick)?;
     if resp.contains("ERROR") {
@@ -521,7 +548,7 @@ pub struct OpOutcome {
 
 /// 查询状态并解析为结构体
 pub fn status_all(name: &str) -> DynResult<ModemStatus> {
-    let mut port = open_at_port(name, 500)?;
+    let mut port = open_at_port_retry(name, 500, 3, Duration::from_millis(500))?;
     init_modem(port.as_mut())?;
     let cpin = send_at(port.as_mut(), "AT+CPIN?", SHORT_TIMEOUT, false)?;
     let cops = send_at(port.as_mut(), "AT+COPS?", SHORT_TIMEOUT, false)?;
@@ -598,7 +625,7 @@ fn poll_registration(
 
 /// 手动锁定运营商（AT+COPS=1,2,"PLMN"），返回结果与最新状态
 pub fn select_operator(name: &str, target: &str, tick: &mut dyn FnMut()) -> DynResult<OpOutcome> {
-    let mut port = open_at_port(name, 500)?;
+    let mut port = open_at_port_retry(name, 500, 3, Duration::from_millis(500))?;
     init_modem(port.as_mut())?;
     let numeric = if target.chars().all(|c| c.is_ascii_digit())
         && (5..=6).contains(&target.len())
@@ -656,7 +683,7 @@ pub fn select_operator(name: &str, target: &str, tick: &mut dyn FnMut()) -> DynR
 
 /// 恢复自动选网（AT+COPS=0），返回结果与最新状态
 pub fn auto_operator(name: &str, tick: &mut dyn FnMut()) -> DynResult<OpOutcome> {
-    let mut port = open_at_port(name, 500)?;
+    let mut port = open_at_port_retry(name, 500, 3, Duration::from_millis(500))?;
     init_modem(port.as_mut())?;
     let resp = send_at_progress(port.as_mut(), "AT+COPS=0", SELECT_TIMEOUT, tick)?;
     if resp.contains("ERROR") {
@@ -678,7 +705,7 @@ pub fn auto_operator(name: &str, tick: &mut dyn FnMut()) -> DynResult<OpOutcome>
 
 /// 查询/锁定制式（AT+XACT，广和通私有）
 pub fn set_mode(name: &str, arg: Option<&str>) -> DynResult<String> {
-    let mut port = open_at_port(name, 500)?;
+    let mut port = open_at_port_retry(name, 500, 3, Duration::from_millis(500))?;
     init_modem(port.as_mut())?;
     let cmd = match arg {
         None => {
