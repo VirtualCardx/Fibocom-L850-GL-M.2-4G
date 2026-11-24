@@ -180,7 +180,7 @@ fn classify(s: &str) -> Lvl {
     let l = s.to_lowercase();
     if s.starts_with("错误") || s.starts_with("失败") || l.contains("error") || l.contains("失败") {
         Lvl::Err
-    } else if s.starts_with("提示") {
+    } else if s.starts_with("提示") || s.contains("未找到") || s.contains("请先") {
         Lvl::Warn
     } else if s.contains("成功") || s.contains("已恢复") || s.contains("已停止") || s.contains("OK")
     {
@@ -669,7 +669,10 @@ fn signal_color(st: &at::ModemStatus) -> Color {
 
 fn view(app: &App) -> El<'_> {
     let idle = app.busy.is_none();
-    let press = |m: Msg| idle.then_some(m);
+    let port_ok = app.port.is_some();
+    // 无串口时禁用需要连接的操作；探测/释放/恢复不依赖串口
+    let press = |m: Msg| (idle && port_ok).then_some(m);
+    let press_any = |m: Msg| idle.then_some(m);
 
     // ---- 顶栏 ----
     let title = text("L850-GL AT 工具")
@@ -735,12 +738,13 @@ fn view(app: &App) -> El<'_> {
     .width(Length::Fixed(280.0))
     .text_size(13)
     .padding([6, 10]);
-    let conn_row = row![
+    let mut conn_row = row![
         text("AT 串口").size(13).color(SUB),
         port_pick,
-        btn("探测串口", Btn::Secondary, press(Msg::Detect)),
-        btn("释放串口", Btn::Primary, press(Msg::Free)),
-        btn("恢复串口", Btn::Secondary, press(Msg::Restore)),
+        btn("探测串口", Btn::Secondary, press_any(Msg::Detect)),
+        btn("刷新状态", Btn::Secondary, press(Msg::Status)),
+        btn("释放串口", Btn::Primary, press_any(Msg::Free)),
+        btn("恢复串口", Btn::Secondary, press_any(Msg::Restore)),
         horizontal_space(),
         text("禁用 ModemControl 不影响蜂窝上网")
             .size(11)
@@ -748,6 +752,9 @@ fn view(app: &App) -> El<'_> {
     ]
     .spacing(10)
     .align_y(iced::Alignment::Center);
+    if app.freed {
+        conn_row = conn_row.push(badge("√ 已释放", GREEN, GREEN_SOFT));
+    }
     let conn_card = card(row![conn_row].width(Length::Fill));
 
     // ---- 状态磁贴 ----
@@ -763,17 +770,26 @@ fn view(app: &App) -> El<'_> {
             let net_val = if st.oper.is_empty() {
                 column![text("未注册").size(14).color(RED)].into()
             } else {
-                let name = if st.oper_friendly.is_empty() {
+                let is_plmn =
+                    st.oper.chars().all(|c| c.is_ascii_digit()) && st.oper.len() >= 5;
+                let name = if !st.oper_friendly.is_empty() {
+                    st.oper_friendly.clone()
+                } else if is_plmn {
                     at::mcc_mnc(&st.oper)
                 } else {
-                    st.oper_friendly.clone()
+                    st.oper.clone()
                 };
-                column![
-                    text(name).size(14).color(INK),
-                    text(at::mcc_mnc(&st.oper)).size(11).color(SUB),
-                ]
-                .spacing(1)
-                .into()
+                // 仅当是数字 PLMN 且没有友好名时，副行显示 PLMN，避免重复
+                let sub = if is_plmn && st.oper_friendly.is_empty() {
+                    at::mcc_mnc(&st.oper)
+                } else {
+                    String::new()
+                };
+                let mut col = column![text(name).size(14).color(INK)];
+                if !sub.is_empty() {
+                    col = col.push(text(sub).size(11).color(SUB));
+                }
+                col.spacing(1).into()
             };
             let reg_color = match st.reg_raw {
                 Some(1) => GREEN,
@@ -840,7 +856,8 @@ fn view(app: &App) -> El<'_> {
     let mode_pick = pick_list(ModeChoice::ALL, app.mode, Msg::ModePicked)
         .width(Length::Fixed(150.0))
         .text_size(13)
-        .padding([6, 10]);
+        .padding([6, 10])
+        .placeholder("选择制式");
     let action_row = row![
         btn("手动搜网", Btn::Primary, press(Msg::Scan)),
         btn("恢复自动选网", Btn::Secondary, press(Msg::Auto)),
@@ -864,7 +881,7 @@ fn view(app: &App) -> El<'_> {
             text("归属").width(fx(110.0)),
             text("PLMN").width(fx(90.0)),
             text("制式").width(fx(130.0)),
-            text("").width(fx(78.0)),
+            text("操作").width(fx(78.0)),
         ]
         .spacing(8),
     )

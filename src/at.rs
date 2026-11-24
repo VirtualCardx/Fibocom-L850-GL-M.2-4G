@@ -703,16 +703,64 @@ pub fn set_mode(name: &str, arg: Option<&str>) -> DynResult<String> {
 
 // ================= 释放 / 恢复 AT 口 =================
 
-const FREE_CMD: &str = "net stop ModemAuthenticatorService & taskkill /IM ModemAuthenticator.exe /F & net stop LENOVO.DPRSVCMON & taskkill /IM LENOVO.DPRSVCMON.exe /F & net stop LENOVO.DPRSVC & taskkill /IM LENOVO.DPRSVC.exe /F & powershell -NoProfile -Command \"Get-PnpDevice -FriendlyName *ModemControl* | Disable-PnpDevice -Confirm:$false\"";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-const RESTORE_CMD: &str = "powershell -NoProfile -Command \"Get-PnpDevice -FriendlyName *ModemControl* | Enable-PnpDevice -Confirm:$false\" & net start ModemAuthenticatorService & net start LENOVO.DPRSVCMON & net start LENOVO.DPRSVC";
+/// 释放脚本：停联想 SIM 锁/DPR 服务 + 禁用 ModemControl，并把结果写入 result 文件
+const FREE_PS: &str = r#"
+$ErrorActionPreference = 'Continue'
+$lines = @()
+net stop ModemAuthenticatorService 2>$null | Out-Null
+taskkill /IM ModemAuthenticator.exe /F 2>$null | Out-Null
+net stop LENOVO.DPRSVCMON 2>$null | Out-Null
+taskkill /IM LENOVO.DPRSVCMON.exe /F 2>$null | Out-Null
+net stop LENOVO.DPRSVC 2>$null | Out-Null
+taskkill /IM LENOVO.DPRSVC.exe /F 2>$null | Out-Null
+# DPRSVCMON 是看门狗，会自动重启服务；禁用服务防止复活（restore 时还原启动类型）
+sc.exe config ModemAuthenticatorService start= disabled 2>$null | Out-Null
+sc.exe config LENOVO.DPRSVCMON start= disabled 2>$null | Out-Null
+sc.exe config LENOVO.DPRSVC start= disabled 2>$null | Out-Null
+try {
+  $ids = (Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction Stop).InstanceId
+  if (-not $ids) { throw 'ModemControl 设备未找到' }
+  foreach ($id in $ids) { pnputil /disable-device "$id" | Out-Null }
+  $lines += 'DISABLE_OK'
+} catch {
+  $lines += ('DISABLE_ERR: ' + $_.Exception.Message)
+}
+Start-Sleep -Seconds 1
+$mc = Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction SilentlyContinue
+$lines += ('ModemControl=' + $(if ($mc) { $mc.Status } else { 'NotFound' }))
+"#;
+
+/// 恢复脚本：启用 ModemControl + 还原服务启动类型并启动
+const RESTORE_PS: &str = r#"
+$ErrorActionPreference = 'Continue'
+$lines = @()
+try {
+  $ids = (Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction Stop).InstanceId
+  if (-not $ids) { throw 'ModemControl 设备未找到' }
+  foreach ($id in $ids) { pnputil /enable-device "$id" | Out-Null }
+  $lines += 'ENABLE_OK'
+} catch {
+  $lines += ('ENABLE_ERR: ' + $_.Exception.Message)
+}
+Start-Sleep -Seconds 1
+sc.exe config ModemAuthenticatorService start= auto 2>$null | Out-Null
+sc.exe config LENOVO.DPRSVCMON start= auto 2>$null | Out-Null
+sc.exe config LENOVO.DPRSVC start= manual 2>$null | Out-Null
+net start ModemAuthenticatorService 2>$null | Out-Null
+net start LENOVO.DPRSVCMON 2>$null | Out-Null
+net start LENOVO.DPRSVC 2>$null | Out-Null
+$mc = Get-PnpDevice -FriendlyName '*ModemControl*' -ErrorAction SilentlyContinue
+$lines += ('ModemControl=' + $(if ($mc) { $mc.Status } else { 'NotFound' }))
+"#;
 
 /// 检测当前进程是否已以管理员身份运行（net session 仅管理员可成功）
 #[cfg(windows)]
 fn is_elevated() -> bool {
     std::process::Command::new("net")
         .arg("session")
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -723,40 +771,90 @@ fn is_elevated() -> bool {
     false
 }
 
-fn run_elevated(inner: &str) -> DynResult<()> {
-    // 已是管理员（GUI 清单 requireAdministrator 启动）则直接执行，不再弹 UAC
-    if is_elevated() {
-        let st = std::process::Command::new("cmd")
-            .args(["/C", inner])
-            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-            .status()
-            .map_err(|e| format!("执行命令失败: {e}"))?;
-        if !st.success() {
-            return Err("命令执行失败".into());
-        }
-        return Ok(());
-    }
-    let ps = format!(
-        "Start-Process cmd -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '/c {inner}'"
+/// 以管理员身份执行 PowerShell 脚本（临时文件，避免引号转义地狱）。
+/// 脚本执行结果（$lines 数组）写入 result 文件，返回其内容。
+#[cfg(windows)]
+fn run_elevated_ps(script_body: &str) -> DynResult<String> {
+    use std::process::Command;
+
+    let tmp = std::env::temp_dir();
+    let ps_path = tmp.join("l850-cops-action.ps1");
+    let result_path = tmp.join("l850-cops-action.result");
+    let _ = std::fs::remove_file(&result_path);
+
+    let script = format!(
+        "{}\n$lines | Out-File -FilePath '{}' -Encoding ascii\n",
+        script_body,
+        result_path.to_string_lossy().replace('\'', "''")
     );
-    let st = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps])
-        .status()
-        .map_err(|e| format!("调用 powershell 失败: {e}"))?;
-    if !st.success() {
-        return Err("提权被取消或失败".into());
+    std::fs::write(&ps_path, script)?;
+
+    let ps_str = ps_path.to_string_lossy().to_string();
+    if is_elevated() {
+        // GUI 已带 requireAdministrator 清单运行，直接执行，无 UAC
+        Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &ps_str])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("执行 powershell 失败: {e}"))?;
+    } else {
+        // CLI 未提权时通过 UAC 提权执行
+        let cmd_line = format!(
+            "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
+            ps_str.replace('\'', "''")
+        );
+        let st = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &cmd_line])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| format!("调用 powershell 失败: {e}"))?;
+        if !st.success() {
+            return Err("提权被取消或失败".into());
+        }
     }
-    Ok(())
+
+    // 给结果文件落盘留一点时间
+    for _ in 0..20 {
+        if let Ok(s) = std::fs::read_to_string(&result_path) {
+            if !s.trim().is_empty() {
+                return Ok(s);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err("脚本未产生结果（提权可能被取消，或 PowerShell 执行失败）".into())
+}
+
+#[cfg(not(windows))]
+fn run_elevated_ps(_script_body: &str) -> DynResult<String> {
+    Err("free/restore 仅适用于 Windows".into())
 }
 
 /// 释放 AT 口：停止联想 SIM 锁/DPR 服务 + 禁用 Intel ModemControl 设备（其 UMDF 驱动独占 COM 口）
 pub fn free_at_port() -> DynResult<String> {
-    run_elevated(FREE_CMD)?;
-    Ok("已停止联想 SIM 锁/DPR 服务并禁用 ModemControl 设备，串口已解锁。".into())
+    let result = run_elevated_ps(FREE_PS)?;
+    if result.contains("DISABLE_ERR") || !result.contains("ModemControl=Disabled") {
+        return Err(format!(
+            "释放未完成，ModemControl 未禁用。脚本输出:\n{}",
+            result.trim()
+        )
+        .into());
+    }
+    Ok(format!(
+        "已停止联想 SIM 锁/DPR 服务并禁用 ModemControl 设备，串口已解锁。\n{}",
+        result.trim()
+    ))
 }
 
 /// 恢复 ModemControl 设备与联想服务
 pub fn restore_at_port() -> DynResult<String> {
-    run_elevated(RESTORE_CMD)?;
-    Ok("已恢复 ModemControl 设备与联想服务。".into())
+    let result = run_elevated_ps(RESTORE_PS)?;
+    if result.contains("ENABLE_ERR") || !result.contains("ModemControl=OK") {
+        return Err(format!(
+            "恢复未完成，ModemControl 状态异常。脚本输出:\n{}",
+            result.trim()
+        )
+        .into());
+    }
+    Ok(format!("已恢复 ModemControl 设备与联想服务。\n{}", result.trim()))
 }
