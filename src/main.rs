@@ -175,6 +175,78 @@ fn cli(args: Vec<String>) -> at::DynResult<()> {
             }
             Ok(())
         }
+        "verify" => {
+            // 端到端验证: free → detect → status → scan → restore → detect 复查
+            // 结果同步写入 %TEMP%\l850-verify.log
+            let log_path = env::temp_dir().join("l850-verify.log");
+            let _ = std::fs::remove_file(&log_path);
+            let emit = |s: &str| {
+                println!("{s}");
+                use std::fs::OpenOptions;
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log_path) {
+                    let _ = writeln!(f, "{s}");
+                }
+            };
+            emit("===== STEP 1/6: free (释放串口) =====");
+            match at::free_at_port() {
+                Ok(m) => emit(&m),
+                Err(e) => emit(&format!("错误: {e}")),
+            }
+            emit("\n===== STEP 2/6: detect (探测 AT 口) =====");
+            match at::probe_ports(None) {
+                Ok(list) if list.is_empty() => emit("未找到 AT 口"),
+                Ok(list) => {
+                    for p in &list {
+                        emit(&format!("发现 AT 口: {p}"));
+                    }
+                }
+                Err(e) => emit(&format!("错误: {e}")),
+            }
+            emit("\n===== STEP 3/6: status (自动选口读状态) =====");
+            match resolve(&None).and_then(|n| at::status_all(&n).map(|s| s.to_text())) {
+                Ok(t) => emit(t.trim()),
+                Err(e) => emit(&format!("错误: {e}")),
+            }
+            emit("\n===== STEP 4/6: scan (手动搜网, 最长180s) =====");
+            match resolve(&None) {
+                Ok(name) => {
+                    let mut n = 0usize;
+                    let mut tick = || dots(&mut n);
+                    match at::scan_operators(&name, &mut tick) {
+                        Ok(ops) => {
+                            emit(&format!("扫描到 {} 个网络:", ops.len()));
+                            for (i, op) in ops.iter().enumerate() {
+                                let long = if op.long.is_empty() { "-" } else { &op.long };
+                                emit(&format!(
+                                    " {:<2} {:<4} {:<22} {:<10} {}",
+                                    i + 1,
+                                    at::stat_name(op.stat),
+                                    long,
+                                    at::mcc_mnc(&op.numeric),
+                                    op.act.map(at::act_name).unwrap_or("-")
+                                ));
+                            }
+                        }
+                        Err(e) => emit(&format!("错误: {e}")),
+                    }
+                }
+                Err(e) => emit(&format!("错误: {e}")),
+            }
+            emit("\n===== STEP 5/6: restore (恢复串口) =====");
+            match at::restore_at_port() {
+                Ok(m) => emit(&m),
+                Err(e) => emit(&format!("错误: {e}")),
+            }
+            emit("\n===== STEP 6/6: detect 复查 (恢复后应无 AT 口) =====");
+            match at::probe_ports(None) {
+                Ok(list) if list.is_empty() => emit("复查通过: 串口已重新锁闭"),
+                Ok(list) => emit(&format!("复查异常: 仍有 {} 个 AT 口可访问", list.len())),
+                Err(e) => emit(&format!("错误: {e}")),
+            }
+            emit("\n验证完成");
+            println!("\n日志: {}", log_path.display());
+            Ok(())
+        }
         "mode" => {
             let name = resolve(&port_arg)?;
             let arg = params.first().map(|s| s.as_str());
@@ -206,6 +278,7 @@ fn usage() {
   l850-cops --port COM7 select <名称|PLMN>   手动锁定运营商
   l850-cops --port COM7 auto                 恢复自动选网
   l850-cops --port COM7 mode [lte|3g|auto]   查询/锁定制式（可选功能）
+  l850-cops verify                           端到端验证: free→detect→status→scan→restore
 
 说明:
   - 不带 --port 时自动探测 AT 口

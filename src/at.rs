@@ -891,8 +891,10 @@ fn run_elevated_ps(_script_body: &str) -> DynResult<String> {
 /// 释放 AT 口：停止联想 SIM 锁/DPR 服务 + 禁用 Intel ModemControl 设备（其 UMDF 驱动独占 COM 口）
 pub fn free_at_port() -> DynResult<String> {
     let result = run_elevated_ps(FREE_PS)?;
-    // ConfigManagerErrorCode: 22 = 已禁用；兼容旧格式的 Status 文本
-    let disabled = result.contains("ModemControl=22") || result.contains("ModemControl=Disabled");
+    // ConfigManagerErrorCode 是 CIM 枚举名: CM_PROB_DISABLED(22) = 已禁用
+    let disabled = result.contains("ModemControl=CM_PROB_DISABLED")
+        || result.contains("ModemControl=22")
+        || result.contains("ModemControl=Disabled");
     if result.contains("DISABLE_ERR") || !disabled {
         return Err(format!(
             "释放未完成，ModemControl 未禁用。脚本输出:\n{}",
@@ -909,8 +911,10 @@ pub fn free_at_port() -> DynResult<String> {
 /// 恢复 ModemControl 设备与联想服务
 pub fn restore_at_port() -> DynResult<String> {
     let result = run_elevated_ps(RESTORE_PS)?;
-    // ConfigManagerErrorCode: 0 = 正常；兼容旧格式的 Status 文本
-    let enabled = result.contains("ModemControl=0") || result.contains("ModemControl=OK");
+    // CM_PROB_NONE(0) = 正常运行
+    let enabled = result.contains("ModemControl=CM_PROB_NONE")
+        || result.contains("ModemControl=0")
+        || result.contains("ModemControl=OK");
     if result.contains("ENABLE_ERR") || !enabled {
         return Err(format!(
             "恢复未完成，ModemControl 状态异常。脚本输出:\n{}",
